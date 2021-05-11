@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/pkg/exemplar"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/scrape"
 	"github.com/prometheus/prometheus/storage"
@@ -22,10 +23,14 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
 )
 
+var _ storage.ExemplarQueryable = (*distributorExemplarQueryable)(nil)
+var _ storage.ExemplarQuerier = (*distributorExemplarQuerier)(nil)
+
 // Distributor is the read interface to the distributor, made an interface here
 // to reduce package coupling.
 type Distributor interface {
 	Query(ctx context.Context, from, to model.Time, matchers ...*labels.Matcher) (model.Matrix, error)
+	QueryExemplars(ctx context.Context, from, to model.Time, matchers ...[]*labels.Matcher) ([]exemplar.QueryResult, error)
 	QueryStream(ctx context.Context, from, to model.Time, matchers ...*labels.Matcher) (*client.QueryStreamResponse, error)
 	LabelValuesForLabelName(ctx context.Context, from, to model.Time, label model.LabelName, matchers ...*labels.Matcher) ([]string, error)
 	LabelNames(context.Context, model.Time, model.Time) ([]string, error)
@@ -64,6 +69,23 @@ func (d distributorQueryable) Querier(ctx context.Context, mint, maxt int64) (st
 func (d distributorQueryable) UseQueryable(now time.Time, _, queryMaxT int64) bool {
 	// Include ingester only if maxt is within QueryIngestersWithin w.r.t. current time.
 	return d.queryIngestersWithin == 0 || queryMaxT >= util.TimeToMillis(now.Add(-d.queryIngestersWithin))
+}
+
+type distributorExemplarQueryable struct {
+	distributor Distributor
+}
+
+func newDistributorExemplarQueryable(d Distributor) storage.ExemplarQueryable {
+	return &distributorExemplarQueryable{
+		distributor: d,
+	}
+}
+
+func (d distributorExemplarQueryable) ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, error) {
+	return &distributorExemplarQuerier{
+		distributor: d.distributor,
+		ctx:         ctx,
+	}, nil
 }
 
 type distributorQuerier struct {
@@ -197,4 +219,19 @@ func (q *distributorQuerier) LabelNames() ([]string, storage.Warnings, error) {
 
 func (q *distributorQuerier) Close() error {
 	return nil
+}
+
+type distributorExemplarQuerier struct {
+	distributor Distributor
+	ctx         context.Context
+}
+
+func (q *distributorExemplarQuerier) Select(start, end int64, matchers ...[]*labels.Matcher) ([]exemplar.QueryResult, error) {
+	allResults, err := q.distributor.QueryExemplars(q.ctx, model.Time(start), model.Time(end), matchers...)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return allResults, nil
 }

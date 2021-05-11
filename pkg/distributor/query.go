@@ -8,6 +8,7 @@ import (
 
 	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/pkg/exemplar"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/weaveworks/common/instrument"
 	"go.uber.org/atomic"
@@ -51,6 +52,83 @@ func (d *Distributor) Query(ctx context.Context, from, to model.Time, matchers .
 		return nil
 	})
 	return matrix, err
+}
+
+func (d *Distributor) QueryExemplars(ctx context.Context, from, to model.Time, matchers ...[]*labels.Matcher) ([]exemplar.QueryResult, error) {
+	var ingResults []cortexpb.TimeSeries
+
+	for _, m := range matchers {
+		req, err := ingester_client.ToQueryRequest(from, to, m)
+		if err != nil {
+			return nil, err
+		}
+
+		replicationSet, err := d.GetIngestersForQuery(ctx, m...)
+		if err != nil {
+			return nil, err
+		}
+
+		// Fetch exemplars from multiple ingesters in parallel, using the replicationSet
+		// to deal with consistency.
+		results, err := replicationSet.Do(ctx, d.cfg.ExtraQueryDelay, func(ctx context.Context, ing *ring.InstanceDesc) (interface{}, error) {
+			client, err := d.ingesterPool.GetClientFor(ing.Addr)
+			if err != nil {
+				return nil, err
+			}
+
+			resp, err := client.(ingester_client.IngesterClient).QueryExemplars(ctx, req)
+
+			d.ingesterQueries.WithLabelValues(ing.Addr).Inc()
+			if err != nil {
+				d.ingesterQueryFailures.WithLabelValues(ing.Addr).Inc()
+				return nil, err
+			}
+
+			return resp.Timeseries, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		for _, result := range results {
+			ingResults = append(ingResults, result.([]cortexpb.TimeSeries)...)
+		}
+	}
+
+	// Merge all results
+	exemplarResults := make(map[string]exemplar.QueryResult)
+
+	for _, results := range ingResults {
+		lbls := cortexpb.FromLabelAdaptersToLabels(results.Labels)
+		lbl := lbls.String()
+		qr, ok := exemplarResults[lbl]
+		if !ok {
+			qr = exemplar.QueryResult{
+				SeriesLabels: lbls,
+				Exemplars:    make([]exemplar.Exemplar, 0),
+			}
+
+		}
+
+		for _, e := range results.Exemplars {
+			qr.Exemplars = append(qr.Exemplars, exemplar.Exemplar{
+				Ts:     e.TimestampMs,
+				HasTs:  true,
+				Value:  e.Value,
+				Labels: cortexpb.FromLabelAdaptersToLabels(e.Labels),
+			})
+		}
+
+		exemplarResults[lbl] = qr
+	}
+
+	var allResults []exemplar.QueryResult
+
+	for _, v := range exemplarResults {
+		allResults = append(allResults, v)
+	}
+
+	return allResults, nil
 }
 
 // QueryStream multiple ingesters via the streaming interface and returns big ol' set of chunks.
@@ -182,6 +260,36 @@ func (d *Distributor) queryIngesters(ctx context.Context, replicationSet ring.Re
 	}
 
 	return result, nil
+}
+
+func (d *Distributor) queryIngestersForExemplars(ctx context.Context, replicationSet ring.ReplicationSet, req *ingester_client.QueryRequest) ([]exemplar.QueryResult, error) {
+	// Fetch samples from multiple ingesters in parallel, using the replicationSet
+	// to deal with consistency.
+	results, err := replicationSet.Do(ctx, d.cfg.ExtraQueryDelay, func(ctx context.Context, ing *ring.InstanceDesc) (interface{}, error) {
+		client, err := d.ingesterPool.GetClientFor(ing.Addr)
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err := client.(ingester_client.IngesterClient).Query(ctx, req)
+		d.ingesterQueries.WithLabelValues(ing.Addr).Inc()
+		if err != nil {
+			d.ingesterQueryFailures.WithLabelValues(ing.Addr).Inc()
+			return nil, err
+		}
+
+		return ingester_client.FromQueryResponse(resp), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	r := make([]exemplar.QueryResult, len(results))
+	for i := range results {
+		r[i] = results[i].(exemplar.QueryResult)
+	}
+
+	return r, nil
 }
 
 // queryIngesterStream queries the ingesters using the new streaming API.

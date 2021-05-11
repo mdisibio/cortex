@@ -16,6 +16,8 @@ service Ingester {
   rpc Query(QueryRequest) returns (QueryResponse) {};
   rpc QueryStream(QueryRequest) returns (stream QueryStreamResponse) {};
 
+  rpc QueryExemplars(QueryRequest) returns (QueryResponse){};
+
   rpc LabelValues(LabelValuesRequest) returns (LabelValuesResponse) {};
   rpc LabelNames(LabelNamesRequest) returns (LabelNamesResponse) {};
   rpc UserStats(UserStatsRequest) returns (UserStatsResponse) {};

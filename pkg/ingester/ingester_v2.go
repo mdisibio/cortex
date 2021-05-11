@@ -1031,6 +1031,58 @@ func (i *Ingester) v2Query(ctx context.Context, req *client.QueryRequest) (*clie
 	return result, ss.Err()
 }
 
+func (i *Ingester) v2QueryExemplars(ctx context.Context, req *client.QueryRequest) (*client.QueryResponse, error) {
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	from, through, matchers, err := client.FromQueryRequest(req)
+	if err != nil {
+		return nil, err
+	}
+
+	//i.metrics.queries.Inc()
+
+	db := i.getTSDB(userID)
+	if db == nil {
+		return &client.QueryResponse{}, nil
+	}
+
+	q, err := db.db.ExemplarQuerier(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// It's not required to return sorted series because series are sorted by the Cortex querier.
+	ss, err := q.Select(int64(from), int64(through), matchers)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &client.QueryResponse{}
+
+	for _, r := range ss {
+
+		ts := cortexpb.TimeSeries{
+			Labels:    cortexpb.FromLabelsToLabelAdapters(r.SeriesLabels),
+			Exemplars: make([]cortexpb.Exemplar, len(r.Exemplars)),
+		}
+
+		for i, e := range r.Exemplars {
+			ts.Exemplars[i] = cortexpb.Exemplar{
+				TimestampMs: e.Ts,
+				Value:       e.Value,
+				Labels:      cortexpb.FromLabelsToLabelAdapters(e.Labels),
+			}
+		}
+
+		result.Timeseries = append(result.Timeseries, ts)
+	}
+
+	return result, nil
+}
+
 func (i *Ingester) v2LabelValues(ctx context.Context, req *client.LabelValuesRequest) (*client.LabelValuesResponse, error) {
 	labelName, startTimestampMs, endTimestampMs, matchers, err := client.FromLabelValuesRequest(req)
 	if err != nil {
